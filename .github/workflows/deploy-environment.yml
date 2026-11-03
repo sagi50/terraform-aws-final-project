@@ -1,0 +1,108 @@
+name: Deploy environment
+
+on:
+  workflow_call:
+    inputs:
+      environment:
+        required: true
+        type: string
+      image_tag:
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: deploy-${{ inputs.environment }}
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: Deploy ${{ inputs.environment }}
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment }}
+
+    defaults:
+      run:
+        working-directory: infra
+
+    env:
+      TF_IN_AUTOMATION: "true"
+      TF_INPUT: "false"
+      TARGET_ENV: ${{ inputs.environment }}
+      IMAGE_TAG: ${{ inputs.image_tag }}
+      NAME_PREFIX: ${{ vars.NAME_PREFIX }}
+      STATE_BUCKET: ${{ vars.TF_STATE_BUCKET }}
+
+    steps:
+      - name: Download repository
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: eu-north-1
+
+      - name: Install Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.10.5"
+          terraform_wrapper: false
+
+      - name: Initialize environment state
+        run: |
+          terraform init -input=false -no-color \
+            -backend-config="bucket=$STATE_BUCKET" \
+            -backend-config="key=voting-app/$TARGET_ENV/terraform.tfstate" \
+            -backend-config="region=eu-north-1" \
+            -backend-config="use_lockfile=true"
+
+      - name: Apply infrastructure
+        run: |
+          terraform apply -auto-approve -input=false -no-color \
+            -var-file="envs/$TARGET_ENV.tfvars" \
+            -var="name_prefix=$NAME_PREFIX" \
+            -var="image_tag=$IMAGE_TAG"
+
+      - name: Smoke test
+        shell: bash
+        run: |
+          vote_url=$(terraform output -raw vote_url)
+          result_url=$(terraform output -raw result_url)
+
+          for url in "$vote_url" "$result_url"; do
+            code=$(curl --silent --show-error --fail \
+              --connect-timeout 10 --max-time 30 \
+              --retry 10 --retry-delay 6 --retry-all-errors \
+              --output /dev/null --write-out '%{http_code}' \
+              "$url/healthz")
+
+            if [ "$code" != "200" ]; then
+              echo "::error::Health check failed for $url: HTTP $code"
+              exit 1
+            fi
+          done
+
+      - name: Verify deployed version
+        shell: bash
+        run: |
+          set +e
+          terraform plan -detailed-exitcode -input=false -no-color \
+            -var-file="envs/$TARGET_ENV.tfvars" \
+            -var="name_prefix=$NAME_PREFIX" \
+            -var="image_tag=$IMAGE_TAG"
+          status=$?
+          set -e
+
+          if [ "$status" -eq 0 ]; then
+            echo "Deployment matches the requested configuration."
+          elif [ "$status" -eq 2 ]; then
+            echo "::error::Changes remain after deployment. Check for an ECS rollback."
+            exit 1
+          else
+            echo "::error::Terraform could not verify the deployment."
+            exit 1
+          fi
